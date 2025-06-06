@@ -32,28 +32,20 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
      -m verl.trainer.fsdp_sft_trainer \
     data.train_files=$HOME/Repo/verl/data/gsm8k/train.parquet \
     data.val_files="$val_files" \
-    # Template settings
     data.use_template=true \
     data.template_name=gsm8k \
     data.use_model_chat_template=false \
-    # Data settings
-    data.prompt_key=question \
-    data.response_key=answer \
-    data.prompt_dict_keys=['question'] \
-    data.response_dict_keys=['answer'] \
     data.micro_batch_size=8 \
     data.micro_batch_size_per_gpu=8 \
     data.train_batch_size=64 \
     data.max_length=6144 \
-    # Model settings
     model.partial_pretrain=Qwen/Qwen3-8B \
     model.use_liger=True \
-    # Training settings
     trainer.project_name=sft \
     trainer.experiment_name=gsm8k_qwen3_8b_sft \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console'] \
     trainer.default_hdfs_dir=null $@ \
     ulysses_sequence_parallel_size=2 \
     use_remove_padding=true \
     trainer.total_epochs=4 \
-    trainer.default_local_dir=$HOME/Repo/verl/sft_models/gsm8k_qwen3_8b_sft
+    trainer.default_local_dir=$HOME/Repo/verl/sft_models/gsm8k_qwen3_8b_sft_test

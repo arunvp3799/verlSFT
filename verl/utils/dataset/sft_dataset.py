@@ -58,8 +58,33 @@ class SFTDataset(Dataset):
         self.config = config
         
         # Load data
-        self.data = pd.concat([pd.read_parquet(f) for f in parquet_files])
+        if hasattr(parquet_files, '__iter__') and not isinstance(parquet_files, str):
+            # Handle OmegaConf ListConfig or other iterable types
+            if hasattr(parquet_files, 'startswith'):
+                # This is likely a string-like object
+                parquet_files = [parquet_files]
+            elif len(parquet_files) > 0:
+                # Check if it's a nested list structure
+                if hasattr(parquet_files[0], '__iter__') and not isinstance(parquet_files[0], str):
+                    parquet_files = list(parquet_files[0])
+                else:
+                    parquet_files = list(parquet_files)
+        else:
+            # Convert single string to list
+            parquet_files = [parquet_files]
         
+        parquet_files_local = self._download(parquet_files)
+        dataframes = []
+        for f in parquet_files_local:
+            df = pd.read_parquet(f)
+            dataframes.append(df)
+        
+        if dataframes:
+            self.data = pd.concat(dataframes, ignore_index=True)
+        else:
+            self.data = pd.DataFrame()
+
+
         # Initialize template manager if using templates
         self.template_manager = None
         if config.get('use_template', False):
@@ -69,6 +94,12 @@ class SFTDataset(Dataset):
             
         # Validate configuration
         self._validate_config()
+    
+    def _download(self, parquet_files: List[str]):
+        parquet_files_local = []
+        for i, parquet_file in enumerate(parquet_files):
+            parquet_files_local.append(copy_to_local(parquet_file, verbose=True, use_shm=self.config.get('use_shm', False)))
+        return parquet_files_local
         
     def _validate_config(self):
         """Validate dataset configuration."""
@@ -81,7 +112,7 @@ class SFTDataset(Dataset):
                 
             # Validate template exists
             self.template_manager.get_template(self.template_name)
-            
+                
         elif self.config.get('use_model_chat_template', False):
             if not hasattr(self.tokenizer, 'apply_chat_template'):
                 raise ValueError("Tokenizer does not support chat templates")
@@ -110,7 +141,7 @@ class SFTDataset(Dataset):
                 self.config['prompt_key'],
                 self.config['response_key']
             ]
-            
+        
         missing_cols = [col for col in required_cols if col not in self.data.columns]
         if missing_cols:
             raise ValueError(f"Missing required columns in data: {missing_cols}")
@@ -156,9 +187,36 @@ class SFTDataset(Dataset):
                 'response_length': response_start
             }
         else:
-            # Original behavior: Use chat template with prompt and response
-            prompt = row[self.config['prompt_key']]
-            response = row[self.config['response_key']]
+            # Handle prompt/response with dict access
+            prompt_key = self.config['prompt_key']
+            response_key = self.config['response_key']
+            
+            # Extract prompt and response, handling nested dictionaries
+            if 'prompt_dict_keys' in self.config:
+                prompt_data = row[prompt_key]
+                if isinstance(prompt_data, dict):
+                    prompt_values = []
+                    for key in self.config['prompt_dict_keys']:
+                        if key in prompt_data:
+                            prompt_values.append(str(prompt_data[key]))
+                    prompt = ' '.join(prompt_values)
+                else:
+                    prompt = str(prompt_data)
+            else:
+                prompt = str(row[prompt_key])
+                
+            if 'response_dict_keys' in self.config:
+                response_data = row[response_key]
+                if isinstance(response_data, dict):
+                    response_values = []
+                    for key in self.config['response_dict_keys']:
+                        if key in response_data:
+                            response_values.append(str(response_data[key]))
+                    response = ' '.join(response_values)
+                else:
+                    response = str(response_data)
+            else:
+                response = str(row[response_key])
             
             # Apply chat template to prompt
             prompt_chat = [{"role": "user", "content": prompt}]
@@ -179,18 +237,37 @@ class SFTDataset(Dataset):
         """Get item from dataset."""
         row = self.data.iloc[idx]
         formatted = self._format_prompt(row)
-        
         # Tokenize
         encodings = self.tokenizer(
             formatted['text'],
-            max_length=self.config['max_length'],
-            truncation=self.config['truncation'],
-            padding='max_length',
-            return_tensors='pt'
+            return_tensors='pt',
+            add_special_tokens=False
         )
         
         input_ids = encodings['input_ids'][0]
         attention_mask = encodings['attention_mask'][0]
+        
+        # padding to max length
+        sequence_length = input_ids.shape[0]
+        if sequence_length < self.config['max_length']:
+            padded_input_ids = torch.ones(size=(self.config['max_length'] - sequence_length,), dtype=input_ids.dtype) * self.tokenizer.pad_token_id
+            padded_attention_mask = torch.zeros(size=(self.config['max_length'] - sequence_length,), dtype=attention_mask.dtype)
+
+            input_ids = torch.cat((input_ids, padded_input_ids))
+            attention_mask = torch.cat((attention_mask, padded_attention_mask))
+        elif sequence_length > self.config['max_length']:
+            truncation = self.config.get('truncation', 'right')
+            if truncation == "left":
+                # actually, left truncation may not be reasonable
+                input_ids = input_ids[-self.config['max_length'] :]
+                attention_mask = attention_mask[-self.config['max_length'] :]
+            elif truncation == "right":
+                input_ids = input_ids[: self.config['max_length']]
+                attention_mask = attention_mask[: self.config['max_length']]
+            elif truncation == "error":
+                raise NotImplementedError(f"{sequence_length=} is larger than {self.config['max_length']=}")
+            else:
+                raise NotImplementedError(f"Unknown truncation method {truncation}")
         
         # Create loss mask
         loss_mask = torch.zeros_like(input_ids)
@@ -204,7 +281,6 @@ class SFTDataset(Dataset):
         loss_mask[min(prompt_length + response_length, loss_mask.size(0)) - 1] = 0
         
         position_ids = compute_position_id_with_mask(attention_mask)
-        
         return {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
