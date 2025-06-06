@@ -1,0 +1,6 @@
+Made the following Changes:
+
+- Added template_manager.py in verl/utils
+- Added prompt_template.yaml in verl/trainer/config
+- Modified sft_trainer.yaml and sft_dataset.py
+- Added gsm8k parquet files
