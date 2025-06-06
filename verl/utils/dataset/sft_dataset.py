@@ -18,17 +18,20 @@ SFT dataset
 Each parquet file contains
 """
 
-from typing import List, Union
+from typing import List, Union, Dict, Any, Optional
 
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
+import logging
+from ..template_manager import TemplateManager
 
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
 
+logger = logging.getLogger(__name__)
 
 class SFTDataset(Dataset):
     """
@@ -38,144 +41,176 @@ class SFTDataset(Dataset):
         config (OmegaConf): the data config
     """
 
-    def __init__(self, parquet_files: Union[str, List[str]], tokenizer, config):
-        prompt_key = config.get("prompt_key", "prompt")
-        prompt_dict_keys = config.get("prompt_dict_keys", None)
-        response_key = config.get("response_key", "response")
-        response_dict_keys = config.get("response_dict_keys", None)
-        max_length = config.get("max_length", 1024)
-        truncation = config.get("truncation", "error")
-        use_shm = config.get('use_shm', False)
-
-        assert truncation in ["error", "left", "right"]
-        self.truncation = truncation
-        self.use_shm = use_shm
-
-        if not isinstance(parquet_files, List):
-            parquet_files = [parquet_files]
-
-        self.parquet_files = parquet_files
-        if isinstance(tokenizer, str):
-            tokenizer = hf_tokenizer(tokenizer)
-        self.tokenizer: PreTrainedTokenizer = tokenizer
-
-        self.prompt_key = prompt_key if isinstance(prompt_key, (tuple, list)) else [prompt_key]
-        self.response_key = response_key if isinstance(response_key, (tuple, list)) else [response_key]
-        self.prompt_dict_keys = prompt_dict_keys if prompt_dict_keys else []
-        self.response_dict_keys = response_dict_keys if response_dict_keys else []
-
-        self.max_length = max_length
-
-        self._download()
-        self._read_files_and_tokenize()
-
-    def _download(self):
-        for i, parquet_file in enumerate(self.parquet_files):
-            self.parquet_files[i] = copy_to_local(parquet_file, verbose=True, use_shm=self.use_shm)
-
-    def _read_files_and_tokenize(self):
-        def series_to_item(ls):
-            import numpy
-            import pandas
-
-            while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:
-                ls = ls[0]
-            return ls
-
-        dataframes = []
-        for parquet_file in self.parquet_files:
-            # read parquet files and cache
-            dataframe = pd.read_parquet(parquet_file)
-            dataframes.append(dataframe)
-        self.dataframe = pd.concat(dataframes)
-        self.prompts = self.dataframe[self.prompt_key]
-        for key in self.prompt_dict_keys:
-            # type(x): pandas.core.series.Series
-            # type(x[0]): numpy.ndarray
-            # type(x[0][0]): dict
-            try:
-                self.prompts = self.prompts.apply(lambda x: series_to_item(x)[key], axis=1)  # noqa: B023
-            except Exception:
-                print(f"self.prompts={self.prompts}")
-                raise
-        if isinstance(self.prompts, pd.DataFrame):
-            self.prompts = self.prompts.squeeze()
-        self.prompts = self.prompts.tolist()
-        self.responses = self.dataframe[self.response_key]
-        for key in self.response_dict_keys:
-            try:
-                self.responses = self.responses.apply(lambda x: series_to_item(x)[key], axis=1)  # noqa: B023
-            except Exception:
-                print(f"self.responses={self.responses}")
-                raise
-        if isinstance(self.responses, pd.DataFrame):
-            self.responses = self.responses.squeeze()
-        self.responses = self.responses.tolist()
-
-    def __len__(self):
-        return len(self.prompts)
-
-    def __getitem__(self, item):
-        tokenizer = self.tokenizer
-
-        prompt = self.prompts[item]
-        response = self.responses[item]
-
-        # apply chat template
-        prompt_chat = [{"role": "user", "content": prompt}]
-
-        # string
-        prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
-        response_chat_str = response + tokenizer.eos_token
-
-        # tokenize
-        prompt_ids_output = tokenizer(prompt_chat_str, return_tensors="pt", add_special_tokens=False)
-        prompt_ids = prompt_ids_output["input_ids"][0]
-        prompt_attention_mask = prompt_ids_output["attention_mask"][0]
-
-        response_ids_output = tokenizer(response_chat_str, return_tensors="pt", add_special_tokens=False)
-        response_ids = response_ids_output["input_ids"][0]
-        response_attention_mask = response_ids_output["attention_mask"][0]
-
-        prompt_length = prompt_ids.shape[0]
-        response_length = response_ids.shape[0]
-
-        input_ids = torch.cat((prompt_ids, response_ids), dim=-1)
-        attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
-
-        # padding to max length
-        sequence_length = input_ids.shape[0]
-        if sequence_length < self.max_length:
-            padded_input_ids = torch.ones(size=(self.max_length - sequence_length,), dtype=input_ids.dtype) * self.tokenizer.pad_token_id
-            padded_attention_mask = torch.zeros(size=(self.max_length - sequence_length,), dtype=attention_mask.dtype)
-
-            input_ids = torch.cat((input_ids, padded_input_ids))
-            attention_mask = torch.cat((attention_mask, padded_attention_mask))
-        elif sequence_length > self.max_length:
-            if self.truncation == "left":
-                # actually, left truncation may not be reasonable
-                input_ids = input_ids[-self.max_length :]
-                attention_mask = attention_mask[-self.max_length :]
-            elif self.truncation == "right":
-                input_ids = input_ids[: self.max_length]
-                attention_mask = attention_mask[: self.max_length]
-            elif self.truncation == "error":
-                raise NotImplementedError(f"{sequence_length=} is larger than {self.max_length=}")
+    def __init__(
+        self,
+        parquet_files: List[str],
+        tokenizer: PreTrainedTokenizer,
+        config: Dict[str, Any],
+    ):
+        """Initialize SFT dataset.
+        
+        Args:
+            parquet_files: List of parquet files containing training data
+            tokenizer: Tokenizer to use
+            config: Configuration dictionary
+        """
+        self.tokenizer = tokenizer
+        self.config = config
+        
+        # Load data
+        self.data = pd.concat([pd.read_parquet(f) for f in parquet_files])
+        
+        # Initialize template manager if using templates
+        self.template_manager = None
+        if config.get('use_template', False):
+            template_path = config.get('template_path', 'verl/trainer/config/prompt_template.yaml')
+            self.template_manager = TemplateManager(template_path)
+            self.template_name = config.get('template_name', 'default')
+            
+        # Validate configuration
+        self._validate_config()
+        
+    def _validate_config(self):
+        """Validate dataset configuration."""
+        if self.config.get('use_template', False):
+            if self.config.get('use_model_chat_template', False):
+                raise ValueError("Cannot use both custom template and model chat template")
+                
+            if not self.template_manager:
+                raise ValueError("Template manager not initialized")
+                
+            # Validate template exists
+            self.template_manager.get_template(self.template_name)
+            
+        elif self.config.get('use_model_chat_template', False):
+            if not hasattr(self.tokenizer, 'apply_chat_template'):
+                raise ValueError("Tokenizer does not support chat templates")
+                
+        # Validate required columns exist
+        required_cols = []
+        if self.config.get('use_template', False):
+            # For templates, we need to validate the data matches template requirements
+            template = self.template_manager.get_template(self.template_name)
+            format_str = template['format']
+            if '{%' in format_str or '{{' in format_str:
+                # For Jinja2 templates, we can't easily extract required columns
+                # Just try to format first row and catch errors
+                try:
+                    self.template_manager.format_prompt(self.template_name, self.data.iloc[0].to_dict())
+                except Exception as e:
+                    raise ValueError(f"Template validation failed: {e}")
             else:
-                raise NotImplementedError(f"Unknown truncation method {self.truncation}")
-
-        position_ids = compute_position_id_with_mask(attention_mask)
-
-        loss_mask = attention_mask.clone()
+                # For Python string formatting, extract required columns
+                import string
+                formatter = string.Formatter()
+                required_cols = [arg[1] for arg in formatter.parse(format_str) if arg[1] is not None]
+        else:
+            # For standard format, check prompt and response keys
+            required_cols = [
+                self.config['prompt_key'],
+                self.config['response_key']
+            ]
+            
+        missing_cols = [col for col in required_cols if col not in self.data.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns in data: {missing_cols}")
+            
+    def _format_prompt(self, row: pd.Series) -> Dict[str, Any]:
+        """Format prompt from row data.
+        
+        Returns:
+            Dictionary containing:
+            - text: The formatted text
+            - prompt_length: Length of the prompt part
+            - response_length: Length of the response part
+        """
+        if self.config.get('use_template', False):
+            text = self.template_manager.format_prompt(self.template_name, row.to_dict())
+            # For templates, we need to find where the response starts
+            # This is more complex and depends on the template format
+            # For now, we'll use a simple heuristic
+            response_start = len(self.tokenizer.encode(text.split('\n')[-1]))
+            prompt_length = len(self.tokenizer.encode(text)) - response_start
+            return {
+                'text': text,
+                'prompt_length': prompt_length,
+                'response_length': response_start
+            }
+        elif self.config.get('use_model_chat_template', False):
+            # Convert row to chat format
+            messages = []
+            if self.config.get('multiturn', {}).get('enable', False):
+                messages = row[self.config['multiturn']['messages_key']]
+            else:
+                messages = [
+                    {'role': 'user', 'content': row[self.config['prompt_key']]},
+                    {'role': 'assistant', 'content': row[self.config['response_key']]}
+                ]
+            text = self.tokenizer.apply_chat_template(messages, tokenize=False)
+            # For chat template, we need to find where the response starts
+            response_start = len(self.tokenizer.encode(text.split('\n')[-1]))
+            prompt_length = len(self.tokenizer.encode(text)) - response_start
+            return {
+                'text': text,
+                'prompt_length': prompt_length,
+                'response_length': response_start
+            }
+        else:
+            # Original behavior: Use chat template with prompt and response
+            prompt = row[self.config['prompt_key']]
+            response = row[self.config['response_key']]
+            
+            # Apply chat template to prompt
+            prompt_chat = [{"role": "user", "content": prompt}]
+            prompt_chat_str = self.tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
+            response_chat_str = response + self.tokenizer.eos_token
+            
+            # Get lengths for loss mask
+            prompt_ids = self.tokenizer(prompt_chat_str, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+            response_ids = self.tokenizer(response_chat_str, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+            
+            return {
+                'text': prompt_chat_str + response_chat_str,
+                'prompt_length': len(prompt_ids),
+                'response_length': len(response_ids)
+            }
+            
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Get item from dataset."""
+        row = self.data.iloc[idx]
+        formatted = self._format_prompt(row)
+        
+        # Tokenize
+        encodings = self.tokenizer(
+            formatted['text'],
+            max_length=self.config['max_length'],
+            truncation=self.config['truncation'],
+            padding='max_length',
+            return_tensors='pt'
+        )
+        
+        input_ids = encodings['input_ids'][0]
+        attention_mask = encodings['attention_mask'][0]
+        
+        # Create loss mask
+        loss_mask = torch.zeros_like(input_ids)
+        prompt_length = formatted['prompt_length']
+        response_length = formatted['response_length']
+        
+        # Mask out prompt for SFT
         if prompt_length > 1:
-            # mask out prompt for SFT.
-            loss_mask[: min(prompt_length, loss_mask.size(0)) - 1] = 0
-        # mask out the last token in response
+            loss_mask[:min(prompt_length, loss_mask.size(0)) - 1] = 0
+        # Mask out the last token in response
         loss_mask[min(prompt_length + response_length, loss_mask.size(0)) - 1] = 0
-
+        
+        position_ids = compute_position_id_with_mask(attention_mask)
+        
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "loss_mask": loss_mask,
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'loss_mask': loss_mask,
+            'position_ids': position_ids
         }
+        
+    def __len__(self) -> int:
+        return len(self.data)

@@ -1,0 +1,27 @@
+# Prompt template configuration file
+# Each template should have a unique name and a format string
+# The format string can use Python's string formatting syntax with named arguments
+# Example: "Question: {question}\nAnswer: {answer}"
+
+# Default template (used when no template is specified)
+default:
+  format: "{prompt}\n{response}"
+
+# Example templates
+gsm8k:
+  format: "Question: {question}\nAnswer: {answer}"
+
+alpaca:
+  format: "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n{response}"
+
+# Multi-turn chat template
+chat:
+  format: |
+    {% for message in messages %}
+    {% if message.role == 'user' %}
+    Human: {{ message.content }}
+    {% elif message.role == 'assistant' %}
+    Assistant: {{ message.content }}
+    {% endif %}
+    {% endfor %}
+    Assistant: 

@@ -4,6 +4,10 @@ data:
   micro_batch_size_per_gpu: 4  # this is also val batch size
   train_files: ~/data/gsm8k/train.parquet
   val_files: ~/data/gsm8k/test.parquet
+  # Template settings
+  use_template: false  # Set to true to use template system
+  template_name: default  # Name of template to use from prompt_template.yaml
+  use_model_chat_template: false  # Set to true to use model's built-in chat template
   # Single-turn settings
   prompt_key: question
   response_key: answer
